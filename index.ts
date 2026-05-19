@@ -241,11 +241,20 @@ type SmilefjesEntry = {
   latestInspectionDate: Date;
   latestInspectionDateText: string;
   faceLabel: string;
+  orgNumber?: string;
+  tilsynId?: string;
+  totalCharacter?: number;
+  inspectionType?: string;
+  statusCode?: string;
+  topicSummaries?: string[];
+  sourceKind?: "csv" | "html";
 };
 
 const SMILEFJES_BASE_URL = "https://smilefjes.mattilsynet.no";
 const SMILEFJES_SARPSBORG_URL =
   "https://smilefjes.mattilsynet.no/kommune/sarpsborg/";
+const SMILEFJES_TILSYN_CSV_URL =
+  "https://data.mattilsynet.no/smilefjes-tilsyn.csv";
 const MATTILSYNET_LOGO_IMAGE_URL =
   "https://upload.wikimedia.org/wikipedia/commons/thumb/5/52/Mattilsynet_logo.svg/640px-Mattilsynet_logo.svg.png";
 const SMILEFJES_MAX_REPORT_AGE_DAYS = 21;
@@ -275,6 +284,12 @@ function isoDateStamp(date: Date) {
   ].join("-");
 }
 
+function formatSmilefjesDate(date: Date) {
+  return `${String(date.getDate()).padStart(2, "0")}.${
+    String(date.getMonth() + 1).padStart(2, "0")
+  }.${String(date.getFullYear()).slice(-2)}`;
+}
+
 function isFreshSmilefjesDate(date: Date, now = new Date()) {
   const cutoff = new Date(now);
   cutoff.setHours(0, 0, 0, 0);
@@ -287,6 +302,13 @@ function isFreshSmilefjesDate(date: Date, now = new Date()) {
   return date >= cutoff && date <= tomorrow;
 }
 
+function smilefjesObjectIdFromValue(value: string | undefined) {
+  const match = cleanText(value, 2048).match(
+    /(Z\d+[A-Z]+)(?:_Tilsynsobjekt)?/i,
+  );
+  return match ? match[1].toUpperCase() : "";
+}
+
 function normalizeSmilefjesSpisestedUrl(value: string | undefined) {
   const candidate = cleanText(value, 2048);
   if (!candidate) return "";
@@ -297,7 +319,7 @@ function normalizeSmilefjesSpisestedUrl(value: string | undefined) {
     parsed.search = "";
     parsed.hash = "";
 
-    if (!/^\/spisested\/[^/]+\/[^/]+\/?$/i.test(parsed.pathname)) {
+    if (!/^\/spisested\/(?:[^/]+\/)?[^/]+\/?$/i.test(parsed.pathname)) {
       return "";
     }
 
@@ -305,6 +327,10 @@ function normalizeSmilefjesSpisestedUrl(value: string | undefined) {
   } catch {
     return "";
   }
+}
+
+function smilefjesObjectUrl(objectId: string) {
+  return `${SMILEFJES_BASE_URL}/spisested/${encodeURIComponent(objectId)}/`;
 }
 
 function splitSmilefjesNameAndAddress(value: string) {
@@ -324,12 +350,73 @@ function normalizeSmilefjesFaceLabel(value: string | undefined) {
     .toLowerCase();
 }
 
+function smilefjesFaceLabelFromCharacter(character: number) {
+  if (character >= 3) return "sur munn";
+  if (character === 2) return "strekmunn";
+  return "blidt smilefjes";
+}
+
 function smilefjesFacePriority(faceLabel: string) {
   const value = faceLabel.toLowerCase();
   if (value.includes("sur")) return 3;
   if (value.includes("strek")) return 2;
   if (value.includes("blidt")) return 0;
   return 1;
+}
+
+function splitSmilefjesCsvLine(line: string) {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ";" && !inQuotes) {
+      fields.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  fields.push(current);
+  return fields.map((field) => cleanText(field, 500));
+}
+
+function parseSmilefjesCsvDate(value: string) {
+  const raw = cleanText(value, 20);
+  const match = raw.match(/^(\d{2})(\d{2})(\d{4})$/);
+  if (!match) return parseSmilefjesDate(raw);
+
+  const day = Number(match[1]);
+  const month = Number(match[2]) - 1;
+  const year = Number(match[3]);
+  const candidate = new Date(year, month, day, 12, 0, 0);
+
+  return Number.isNaN(candidate.getTime()) ? null : candidate;
+}
+
+function smilefjesAssessmentFromCharacter(character: number | undefined) {
+  if (character === undefined || !Number.isFinite(character)) {
+    return "Se Mattilsynets rapport for vurdering.";
+  }
+  if (character >= 3) {
+    return "Mattilsynet har avdekket alvorlig regelverksbrudd.";
+  }
+  if (character === 2) {
+    return "Mattilsynet har avdekket regelverksbrudd som krever oppfølging.";
+  }
+  if (character === 1) {
+    return "Mattilsynet har avdekket mindre regelverksbrudd som ikke krever oppfølging.";
+  }
+  return "Mattilsynet har ikke avdekket regelverksbrudd som krever oppfølging.";
 }
 
 function extractSmilefjesEntriesFromMunicipalityHtml(html: string) {
@@ -371,19 +458,142 @@ function extractSmilefjesEntriesFromMunicipalityHtml(html: string) {
       ? structuredName
       : fallback.name;
     const address = structuredAddress || fallback.address;
+    const objectId = smilefjesObjectIdFromValue(url);
 
-    if (!name) return;
+    if (!name || !objectId) return;
 
     seen.add(url);
     entries.push({
       name,
       address,
-      url,
+      url: smilefjesObjectUrl(objectId),
       latestInspectionDate,
       latestInspectionDateText: dateMatch[0],
       faceLabel,
+      sourceKind: "html",
     });
   });
+
+  return entries.sort((left, right) =>
+    smilefjesFacePriority(right.faceLabel) -
+      smilefjesFacePriority(left.faceLabel) ||
+    right.latestInspectionDate.getTime() - left.latestInspectionDate.getTime()
+  );
+}
+
+function smilefjesIndexFromMunicipalityHtml(html: string) {
+  const index = new Map<string, SmilefjesEntry>();
+  extractSmilefjesEntriesFromMunicipalityHtml(html).forEach((entry) => {
+    const objectId = smilefjesObjectIdFromValue(entry.url);
+    if (objectId) index.set(objectId, entry);
+  });
+  return index;
+}
+
+function extractSmilefjesEntriesFromTilsynCsv(
+  csv: string,
+  municipalityIndex: Map<string, SmilefjesEntry>,
+) {
+  const lines = csv.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length < 2) return [];
+
+  const headers = splitSmilefjesCsvLine(lines[0]);
+  const indexOf = (name: string) => headers.indexOf(name);
+  const indexes = {
+    objectId: indexOf("tilsynsobjektid"),
+    orgNumber: indexOf("orgnummer"),
+    name: indexOf("navn"),
+    address1: indexOf("adrlinje1"),
+    address2: indexOf("adrlinje2"),
+    postnr: indexOf("postnr"),
+    poststed: indexOf("poststed"),
+    tilsynId: indexOf("tilsynid"),
+    status: indexOf("status"),
+    date: indexOf("dato"),
+    totalCharacter: indexOf("total_karakter"),
+    inspectionType: indexOf("tilsynsbesoektype"),
+    topic1: indexOf("tema1_no"),
+    topic1Character: indexOf("karakter1"),
+    topic2: indexOf("tema2_no"),
+    topic2Character: indexOf("karakter2"),
+    topic3: indexOf("tema3_no"),
+    topic3Character: indexOf("karakter3"),
+    topic4: indexOf("tema4_no"),
+    topic4Character: indexOf("karakter4"),
+  };
+  const requiredIndexes = [
+    indexes.objectId,
+    indexes.name,
+    indexes.date,
+    indexes.totalCharacter,
+  ];
+  if (requiredIndexes.some((index) => index < 0)) {
+    console.error(
+      "   -> Smilefjes CSV mangler obligatoriske kolonner:",
+      headers.join(", "),
+    );
+    return [];
+  }
+
+  const entries: SmilefjesEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const line of lines.slice(1)) {
+    const fields = splitSmilefjesCsvLine(line);
+    const objectId = smilefjesObjectIdFromValue(fields[indexes.objectId]);
+    const indexed = municipalityIndex.get(objectId);
+    if (!indexed) continue;
+
+    const latestInspectionDate = parseSmilefjesCsvDate(fields[indexes.date]);
+    if (!latestInspectionDate || !isFreshSmilefjesDate(latestInspectionDate)) {
+      continue;
+    }
+
+    const tilsynId = cleanText(fields[indexes.tilsynId], 80);
+    const seenKey = `${objectId}:${
+      tilsynId || isoDateStamp(latestInspectionDate)
+    }`;
+    if (seen.has(seenKey)) continue;
+    seen.add(seenKey);
+
+    const totalCharacter = Number(fields[indexes.totalCharacter]);
+    const faceLabel = smilefjesFaceLabelFromCharacter(totalCharacter);
+    const addressParts = [
+      cleanText(fields[indexes.address1], 120),
+      cleanText(fields[indexes.address2], 120),
+      `${cleanText(fields[indexes.postnr], 8)} ${
+        cleanText(fields[indexes.poststed], 80)
+      }`.trim(),
+    ].filter(Boolean);
+    const topicSummaries = [
+      [fields[indexes.topic1], fields[indexes.topic1Character]],
+      [fields[indexes.topic2], fields[indexes.topic2Character]],
+      [fields[indexes.topic3], fields[indexes.topic3Character]],
+      [fields[indexes.topic4], fields[indexes.topic4Character]],
+    ].map(([topic, character]) => {
+      const topicName = cleanText(topic, 120);
+      const topicCharacter = cleanText(character, 20);
+      return topicName && topicCharacter
+        ? `${topicName}: ${topicCharacter}`
+        : "";
+    }).filter(Boolean);
+
+    entries.push({
+      name: cleanText(fields[indexes.name], 160) || indexed.name,
+      address: addressParts.join(", ") || indexed.address,
+      url: smilefjesObjectUrl(objectId),
+      latestInspectionDate,
+      latestInspectionDateText: formatSmilefjesDate(latestInspectionDate),
+      faceLabel,
+      orgNumber: cleanText(fields[indexes.orgNumber], 20),
+      tilsynId,
+      totalCharacter,
+      inspectionType: cleanText(fields[indexes.inspectionType], 40),
+      statusCode: cleanText(fields[indexes.status], 20),
+      topicSummaries,
+      sourceKind: "csv",
+    });
+  }
 
   return entries.sort((left, right) =>
     smilefjesFacePriority(right.faceLabel) -
@@ -448,28 +658,36 @@ function extractSmilefjesDetailData(html: string) {
   };
 }
 
-function buildSmilefjesNewsItem(entry: SmilefjesEntry, detailHtml: string) {
-  const detail = extractSmilefjesDetailData(detailHtml);
-  const status = detail.assessment || "Se Mattilsynets rapport for vurdering.";
+function buildSmilefjesNewsItem(entry: SmilefjesEntry, detailHtml = "") {
+  const detail = detailHtml ? extractSmilefjesDetailData(detailHtml) : null;
+  const status = detail?.assessment ||
+    smilefjesAssessmentFromCharacter(entry.totalCharacter);
   const faceText = entry.faceLabel
     ? ` Siste resultat: ${entry.faceLabel}.`
     : "";
   const addressText = entry.address ? ` Adresse: ${entry.address}.` : "";
-  const orgText = detail.orgNumber ? ` Orgnr.: ${detail.orgNumber}.` : "";
-  const concernText = detail.concernTexts.length > 0
-    ? ` Funn: ${detail.concernTexts.join(" ")}`
+  const orgNumber = detail?.orgNumber || entry.orgNumber || "";
+  const orgText = orgNumber ? ` Orgnr.: ${orgNumber}.` : "";
+  const concernTexts = detail?.concernTexts.length
+    ? detail.concernTexts
+    : entry.topicSummaries || [];
+  const concernText = concernTexts.length > 0
+    ? ` Funn/tema: ${concernTexts.join(" ")}`
     : "";
-  const followupText = detail.previousBreachResolved
+  const followupText = detail?.previousBreachResolved
     ? " Rapporten omtaler også at regelverksbrudd fra forrige inspeksjon er fulgt opp og funnet i orden."
     : "";
-  const titlePrefix = detail.needsFollowup
+  const hasNeedsFollowup = detail?.needsFollowup ||
+    (entry.totalCharacter !== undefined && entry.totalCharacter >= 2);
+  const titlePrefix = hasNeedsFollowup
     ? "Smilefjesavvik"
-    : detail.previousBreachResolved
+    : detail?.previousBreachResolved
     ? "Smilefjes: avvik fulgt opp"
     : "Ny smilefjesrapport";
-  const uniqueUrl = `${entry.url}#tilsyn-${
-    isoDateStamp(entry.latestInspectionDate)
-  }`;
+  const uniqueSuffix = entry.tilsynId
+    ? cleanText(entry.tilsynId, 100)
+    : isoDateStamp(entry.latestInspectionDate);
+  const uniqueUrl = `${entry.url}#tilsyn-${encodeURIComponent(uniqueSuffix)}`;
 
   return {
     title: `${titlePrefix}: ${entry.name}`,
@@ -1908,13 +2126,54 @@ serve(async (req: Request) => {
       }
 
       const html = await res.text();
-      const recentEntries = extractSmilefjesEntriesFromMunicipalityHtml(html)
-        .filter((entry) => isFreshSmilefjesDate(entry.latestInspectionDate))
-        .slice(0, SMILEFJES_MAX_DETAIL_PAGES);
+      const municipalityIndex = smilefjesIndexFromMunicipalityHtml(html);
+      let recentEntries: SmilefjesEntry[] = [];
+
+      try {
+        const csvRes = await fetch(SMILEFJES_TILSYN_CSV_URL, {
+          headers: {
+            ...HEADERS,
+            Accept: "text/csv",
+          },
+        });
+        if (csvRes.ok) {
+          const csv = await csvRes.text();
+          recentEntries = extractSmilefjesEntriesFromTilsynCsv(
+            csv,
+            municipalityIndex,
+          );
+          console.log(
+            `   -> Smilefjes CSV ga ${recentEntries.length} ferske Sarpsborg-tilsyn.`,
+          );
+        } else {
+          console.log(`   -> Smilefjes CSV svarte HTTP ${csvRes.status}.`);
+        }
+      } catch (csvError) {
+        console.error("   -> Feil ved henting av Smilefjes CSV:", csvError);
+      }
+
+      if (recentEntries.length === 0) {
+        recentEntries = extractSmilefjesEntriesFromMunicipalityHtml(html)
+          .filter((entry) => isFreshSmilefjesDate(entry.latestInspectionDate));
+        console.log(
+          `   -> Bruker HTML-fallback med ${recentEntries.length} ferske Smilefjes-kandidater.`,
+        );
+      }
+
+      recentEntries = recentEntries.slice(0, SMILEFJES_MAX_DETAIL_PAGES);
 
       let smilefjesCount = 0;
       for (const entry of recentEntries) {
         try {
+          if (entry.sourceKind === "csv") {
+            const item = buildSmilefjesNewsItem(entry);
+            if (!rawNews.some((news) => news.url === item.url)) {
+              pushNews(rawNews, item);
+              smilefjesCount++;
+            }
+            continue;
+          }
+
           const detailRes = await fetch(entry.url, { headers: HEADERS });
           if (!detailRes.ok) {
             console.log(
