@@ -45,6 +45,7 @@ const HEADERS = {
 const VALID_PRIORITY_TAGS = new Set<PriorityTag>(["RED", "YELLOW", "GREEN"]);
 const AI_BATCH_SIZE = 25;
 const SMILEFJES_BATCH_RESERVE = 12;
+const HRS_RSS_URL = "https://www.hovedredningssentralen.no/feed/";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -60,6 +61,10 @@ function cleanText(value: unknown, maxLength: number) {
     .trim();
 
   return normalized.slice(0, maxLength);
+}
+
+function stripHtmlToText(value: unknown, maxLength: number) {
+  return cleanText(cheerio.load(String(value ?? "")).text(), maxLength);
 }
 
 function toValidDate(value: unknown) {
@@ -2205,164 +2210,73 @@ serve(async (req: Request) => {
       console.error("   -> Feil Smilefjes:", e);
     }
 
-    const nitterServers = [
-      "https://nitter.poast.org",
-      "https://nitter.privacydev.net",
-      "https://nitter.esmailelbob.xyz",
-      "https://nitter.net",
-    ];
-
     // ========================================================================
-    // KILDE 12: HRS SØR-NORGE (Nitter RSS med fallback)
+    // KILDE 12: HOVEDREDNINGSSENTRALEN (OFFISIELL RSS)
     // ========================================================================
     try {
-      console.log("12. Henter RSS fra HRS Sør-Norge (Nitter)...");
-      let xml: string | null = null;
+      console.log("12. Henter offisiell RSS fra Hovedredningssentralen...");
+      const res = await fetch(HRS_RSS_URL, { headers: HEADERS });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} fra HRS RSS`);
+      }
 
-      for (const server of nitterServers) {
-        try {
-          const res = await fetch(`${server}/hrsSorNorge/rss`, {
-            headers: HEADERS,
+      const xml = await res.text();
+      const data: any = await parseStringPromise(xml);
+      let hrsCount = 0;
+      const threeDaysAgo = new Date();
+      threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+      const localKeywords = [
+        "østfold",
+        "sarpsborg",
+        "fredrikstad",
+        "halden",
+        "moss",
+        "hvaler",
+        "råde",
+        "rygge",
+        "rakkestad",
+        "indre østfold",
+        "oslofjord",
+        "svinesund",
+        "skjeberg",
+        "tune",
+        "greåker",
+        "glomma",
+      ];
+
+      (data.rss?.channel?.[0]?.item || []).forEach((item: any) => {
+        if (hrsCount >= 5) return;
+
+        const title = stripHtmlToText(item.title?.[0], 160);
+        const description = stripHtmlToText(item.description?.[0], 500);
+        const pubDate = toValidDate(item.pubDate?.[0]);
+        const text = `${title} ${description}`.toLowerCase();
+        const isRelevant = localKeywords.some((keyword) =>
+          text.includes(keyword)
+        );
+
+        if (title && isRelevant && pubDate >= threeDaysAgo) {
+          pushNews(rawNews, {
+            title: `HRS: ${cleanText(title, 80)}`,
+            description,
+            url: item.link?.[0] || HRS_RSS_URL,
+            source: "HRS Sør-Norge",
+            published_at: pubDate,
           });
-          if (res.ok) {
-            xml = await res.text();
-            break;
-          }
-        } catch {
-          // Feilet stille, prøver neste server i listen
+          hrsCount++;
         }
-      }
+      });
 
-      if (xml) {
-        const data: any = await parseStringPromise(xml);
-        let hrsCount = 0;
-        const threeDaysAgo = new Date();
-        threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-        (data.rss.channel[0].item || []).forEach((item: any) => {
-          if (hrsCount >= 5) return;
-
-          const title = item.title ? item.title[0] : "";
-          const desc = item.description
-            ? item.description[0].replace(/<[^>]*>?/gm, "")
-            : "";
-          const pubDate = item.pubDate ? new Date(item.pubDate[0]) : new Date();
-
-          const isRelevant = [
-            "østfold",
-            "sarpsborg",
-            "fredrikstad",
-            "halden",
-            "moss",
-            "hvaler",
-            "råde",
-            "rygge",
-            "oslofjord",
-            "svinesund",
-            "skjeberg",
-          ].some((keyword) =>
-            (title + " " + desc).toLowerCase().includes(keyword)
-          );
-
-          if (isRelevant && pubDate >= threeDaysAgo) {
-            pushNews(rawNews, {
-              title: `HRS: ${cleanText(title, 50)}...`,
-              description: cleanText(desc, 300),
-              url: item.link ? item.link[0] : "https://twitter.com/hrsSorNorge",
-              source: "HRS Sør-Norge",
-              published_at: pubDate,
-            });
-            hrsCount++;
-          }
-        });
-      } else {
-        console.log("   -> Alle Nitter-servere for HRS var nede.");
-      }
+      console.log(`   -> La til ${hrsCount} relevante HRS-saker.`);
     } catch (e: any) {
-      console.error("   -> Feil HRS Sør-Norge:", e);
+      console.error("   -> Feil HRS RSS:", e);
     }
 
     // ========================================================================
-    // KILDE 13: ØST 110-SENTRAL (Nitter RSS med fallback)
+    // KILDE 13: STORTINGET (ØSTFOLD-REPRESENTANTER)
     // ========================================================================
     try {
-      console.log("13. Henter RSS fra Øst 110-sentral (Nitter)...");
-      let xml: string | null = null;
-
-      for (const server of nitterServers) {
-        try {
-          const res = await fetch(`${server}/Ost110Sentral/rss`, {
-            headers: HEADERS,
-          });
-          if (res.ok) {
-            xml = await res.text();
-            break;
-          }
-        } catch {
-          // Feilet stille, prøver neste server i listen
-        }
-      }
-
-      if (xml) {
-        const data: any = await parseStringPromise(xml);
-        let brannCount = 0;
-        const threeDaysAgo = new Date();
-        threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-        (data.rss.channel[0].item || []).forEach((item: any) => {
-          if (brannCount >= 5) return;
-
-          const title = item.title ? item.title[0] : "";
-          const desc = item.description
-            ? item.description[0].replace(/<[^>]*>?/gm, "")
-            : "";
-          const pubDate = item.pubDate ? new Date(item.pubDate[0]) : new Date();
-
-          const isRelevant = [
-            "sarpsborg",
-            "fredrikstad",
-            "halden",
-            "moss",
-            "østfold",
-            "råde",
-            "rygge",
-            "hvaler",
-            "rakkestad",
-            "våler",
-            "aremark",
-            "indre østfold",
-            "skiptvet",
-            "skjeberg",
-            "tune",
-            "greåker",
-            "borge",
-          ].some((keyword) =>
-            (title + " " + desc).toLowerCase().includes(keyword)
-          );
-
-          if (isRelevant && pubDate >= threeDaysAgo) {
-            pushNews(rawNews, {
-              title: `Brannvesenet: ${cleanText(title, 50)}...`,
-              description: cleanText(desc, 300),
-              url: item.link
-                ? item.link[0]
-                : "https://twitter.com/Ost110Sentral",
-              source: "Øst 110-sentral",
-              published_at: pubDate,
-            });
-            brannCount++;
-          }
-        });
-      } else {
-        console.log("   -> Alle Nitter-servere for 110 var nede.");
-      }
-    } catch (e: any) {
-      console.error("   -> Feil Øst 110-sentral:", e);
-    }
-
-    // ========================================================================
-    // KILDE 14: STORTINGET (ØSTFOLD-REPRESENTANTER)
-    // ========================================================================
-    try {
-      console.log("14. Henter Stortinget-aktivitet for Østfold...");
+      console.log("13. Henter Stortinget-aktivitet for Østfold...");
       const sessionId = await getCurrentStortingetSession();
       const representatives = await getStortingetRepresentatives();
 
@@ -2423,7 +2337,6 @@ serve(async (req: Request) => {
       "Østfold Kollektivtrafikk",
       "Bane NOR",
       "HRS Sør-Norge",
-      "Øst 110-sentral",
       "Stortinget",
       "Mattilsynet Smilefjes",
     ];
