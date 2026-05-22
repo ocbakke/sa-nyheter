@@ -751,6 +751,10 @@ const STORTINGET_TALE_TYPE_LABELS: Record<number, string> = {
 };
 
 const POLITILOGGEN_RSS_URL = "https://api.politiloggen.politiet.no/feeds/rss";
+const POLITIET_OST_NYHETER_RSS_URL =
+  "https://www.politiet.no/api/rss/nyheter?distrikt=ost";
+const POLITIET_LOGO_IMAGE_URL =
+  "https://www.politiet.no/globalassets/forside-admin/politiet.png";
 const POLITILOGGEN_VALID_PLACES = [
   "sarpsborg",
   "fredrikstad",
@@ -833,6 +837,23 @@ function isRelevantPolitiloggenMessage(
 function normalizePolitiloggenTitle(value: string) {
   const title = cleanText(value.replace(/\s*\(ID:\s*[^)]+\)\s*$/i, ""), 160);
   return title || "Politiet: Hendelse";
+}
+
+function isRelevantPolitietOstNews(
+  title: string,
+  description: string,
+  url = "",
+) {
+  const fullText = cleanText(` ${title} ${description} ${url} `, 3000)
+    .toLowerCase();
+  const isRelevant = POLITILOGGEN_VALID_PLACES.some((place) =>
+    fullText.includes(place)
+  );
+  if (!isRelevant) return false;
+
+  return !POLITILOGGEN_NEGATIVE_PLACES.some((place) =>
+    fullText.includes(place)
+  );
 }
 
 function daysAgo(days: number) {
@@ -1488,6 +1509,66 @@ serve(async (req: Request) => {
       }
     } catch (e: unknown) {
       console.error("   -> Feil Politiloggen:", e);
+    }
+
+    // ========================================================================
+    // KILDE 1B: POLITIET ØST NYHETER/PRESSEMELDINGER
+    // ========================================================================
+    try {
+      console.log("1B. Henter nyheter/pressemeldinger fra Politiet Øst...");
+      const res = await fetch(POLITIET_OST_NYHETER_RSS_URL, {
+        headers: {
+          Accept: "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+          "User-Agent": HEADERS["User-Agent"],
+        },
+      });
+
+      if (!res.ok) {
+        console.error(
+          `   -> Politiet Øst RSS svarte HTTP ${res.status}: ${await res
+            .text()}`,
+        );
+      } else {
+        const xml = await res.text();
+        const data = await parseStringPromise(xml) as {
+          rss?: { channel?: Array<{ item?: PolitiloggenRssItem[] }> };
+        };
+        const items = data.rss?.channel?.[0]?.item || [];
+        const cutoff = daysAgo(45);
+        let poCount = 0;
+
+        items.forEach((item) => {
+          if (poCount >= 10) return;
+
+          const title = firstXmlText(item.title, 180);
+          const description = firstXmlText(item.description, 700) ||
+            "Politiet har publisert en nyhet/pressemelding fra Øst politidistrikt.";
+          const url = firstXmlText(item.link, 2048) ||
+            firstXmlText(item.guid, 2048);
+          const pubDate = item.pubDate?.[0]
+            ? new Date(item.pubDate[0])
+            : new Date();
+
+          if (!title || !url || pubDate < cutoff) return;
+          if (!isRelevantPolitietOstNews(title, description, url)) return;
+
+          pushNews(rawNews, {
+            title: `Politiet Øst: ${cleanText(title, 140)}`,
+            description,
+            url,
+            source: "Politiet Øst pressemeldinger",
+            published_at: pubDate,
+            image_url: POLITIET_LOGO_IMAGE_URL,
+          });
+          poCount++;
+        });
+
+        console.log(
+          `   -> Lagde ${poCount} saker fra Politiet Øst pressemeldinger.`,
+        );
+      }
+    } catch (e: unknown) {
+      console.error("   -> Feil Politiet Øst pressemeldinger:", e);
     }
 
     // ========================================================================
@@ -2332,6 +2413,7 @@ serve(async (req: Request) => {
     );
     const sourcesAllowingDuplicateTitles = [
       "Politiloggen (Øst)",
+      "Politiet Øst pressemeldinger",
       "Vegtrafikksentralen",
       "Varsom / MET",
       "Østfold Kollektivtrafikk",
@@ -2394,6 +2476,12 @@ Viktig sikkerhetsregel:
 - Gi score 6-8 når en Østfold-representant stiller spørsmål, fremmer forslag eller holder innlegg om Sarpsborg, Østfold, Sykehuset Østfold, samferdsel i regionen, Nav/arbeidsliv, skole, politi, beredskap eller kommuneøkonomi.
 - Gi score 3-5 når aktiviteten primært viser at en lokal representant er aktiv på et nasjonalt tema uten tydelig lokal konsekvens.
 - Gi score 0 når saken er nasjonal rutineaktivitet uten lokal kobling eller nyhetsverdi for SA-leserne.
+
+### POLITIET ØST PRESSEMELDINGER
+- Saker fra kilden "Politiet Øst pressemeldinger" er offisielle nyheter og pressemeldinger fra politiet.no, ikke korte hendelseslogg-meldinger.
+- Gi score 6-9 for alvorlig kriminalitet, dødsfall, større etterforskninger, siktelser, dominerende beredskapssaker eller hendelser med tydelig kobling til Sarpsborg/Østfold.
+- Gi score 3-5 for mindre lokale oppdateringer eller pressemeldinger fra naboområder.
+- Gi score 0 hvis saken gjelder Romerike/Follo/andre deler av Øst politidistrikt uten tydelig relevans for SA-området.
 
 ### MATTILSYNET SMILEFJES
 - Saker fra kilden "Mattilsynet Smilefjes" er ferske tilsynsrapporter for lokale serveringssteder, ikke ferdige nyhetsartikler.
